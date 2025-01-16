@@ -19,15 +19,17 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.system import sentry
 from openpilot.selfdrive.car.car_helpers import get_demo_car_params
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.selfdrive.classic_modeld.runners import ModelRunner, Runtime
-from openpilot.selfdrive.classic_modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.classic_modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
-from openpilot.selfdrive.classic_modeld.constants import ModelConstants
-from openpilot.selfdrive.classic_modeld.models.commonmodel_pyx import ModelFrame, CLContext
+from openpilot.selfdrive.frogpilot_modeld.runners import ModelRunner, Runtime
+from openpilot.selfdrive.frogpilot_modeld.parse_model_outputs import Parser
+from openpilot.selfdrive.frogpilot_modeld.fill_model_msg import fill_model_msg, PublishState
+from openpilot.selfdrive.frogpilot_modeld.constants import ModelConstants
+from openpilot.selfdrive.frogpilot_modeld.models.commonmodel_pyx import ModelFrame, CLContext
 
-from openpilot.selfdrive.frogpilot.frogpilot_variables import METADATAS_PATH, MODELS_PATH, get_frogpilot_toggles
+from openpilot.selfdrive.frogpilot.frogpilot_variables import DEFAULT_CLASSIC_MODEL, METADATAS_PATH, MODELS_PATH, get_frogpilot_toggles
 
-PROCESS_NAME = "selfdrive.classic_modeld.classic_modeld"
+MODEL = "duck-amigo"
+
+PROCESS_NAME = "selfdrive.frogpilot_modeld.frogpilot_modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 MODEL_PATHS = {
@@ -51,31 +53,25 @@ class ModelState:
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
   model: ModelRunner
 
-  def __init__(self, context: CLContext, model: str, model_version: str):
-    # FrogPilot variables
+  def __init__(self, context: CLContext, model: str, model_version: str, navigation: bool, radarless: bool):
     MODEL_PATHS[ModelRunner.THNEED] = MODELS_PATH / f'{model}.thneed'
-
-    with open(METADATAS_PATH / f'supercombo_metadata_{model_version}.pkl', 'rb') as f:
-      model_metadata = pickle.load(f)
-
-    input_shapes = model_metadata.get('input_shapes')
-    self.navigation = 'nav_features' in input_shapes and 'nav_instructions' in input_shapes
-    self.radarless = 'radar_tracks' in input_shapes
 
     self.frame = ModelFrame(context)
     self.wide_frame = ModelFrame(context)
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
-
     self.inputs = {
       'desire': np.zeros(ModelConstants.DESIRE_LEN * (ModelConstants.HISTORY_BUFFER_LEN+1), dtype=np.float32),
       'traffic_convention': np.zeros(ModelConstants.TRAFFIC_CONVENTION_LEN, dtype=np.float32),
       'lateral_control_params': np.zeros(ModelConstants.LATERAL_CONTROL_PARAMS_LEN, dtype=np.float32),
       'prev_desired_curv': np.zeros(ModelConstants.PREV_DESIRED_CURV_LEN * (ModelConstants.HISTORY_BUFFER_LEN+1), dtype=np.float32),
       **({'nav_features': np.zeros(ModelConstants.NAV_FEATURE_LEN, dtype=np.float32),
-          'nav_instructions': np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)} if self.navigation else {}),
+          'nav_instructions': np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)} if navigation else {}),
       'features_buffer': np.zeros((ModelConstants.HISTORY_BUFFER_LEN) * ModelConstants.FEATURE_LEN, dtype=np.float32),
-      **({'radar_tracks': np.zeros(ModelConstants.RADAR_TRACKS_LEN * ModelConstants.RADAR_TRACKS_WIDTH, dtype=np.float32)} if self.radarless else {}),
+      **({'radar_tracks': np.zeros(ModelConstants.RADAR_TRACKS_LEN * ModelConstants.RADAR_TRACKS_WIDTH, dtype=np.float32)} if radarless else {}),
     }
+
+    with open(METADATAS_PATH / f'supercombo_metadata_{model_version}.pkl', 'rb') as f:
+      model_metadata = pickle.load(f)
 
     self.output_slices = model_metadata['output_slices']
     net_output_size = model_metadata['output_shapes']['outputs'][1]
@@ -95,7 +91,7 @@ class ModelState:
     return parsed_model_outputs
 
   def run(self, buf: VisionBuf, wbuf: VisionBuf, transform: np.ndarray, transform_wide: np.ndarray,
-                inputs: dict[str, np.ndarray], prepare_only: bool) -> dict[str, np.ndarray] | None:
+                inputs: dict[str, np.ndarray], prepare_only: bool, navigation: bool, radarless: bool) -> dict[str, np.ndarray] | None:
     # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
     inputs['desire'][0] = 0
     self.inputs['desire'][:-ModelConstants.DESIRE_LEN] = self.inputs['desire'][ModelConstants.DESIRE_LEN:]
@@ -105,11 +101,11 @@ class ModelState:
     self.inputs['traffic_convention'][:] = inputs['traffic_convention']
     self.inputs['lateral_control_params'][:] = inputs['lateral_control_params']
 
-    if self.navigation:
+    if navigation:
       self.inputs['nav_features'][:] = inputs['nav_features']
       self.inputs['nav_instructions'][:] = inputs['nav_instructions']
 
-    if self.radarless:
+    if radarless:
       self.inputs['radar_tracks'][:] = inputs['radar_tracks']
 
     # if getCLBuffer is not None, frame will be None
@@ -131,14 +127,14 @@ class ModelState:
 
 
 def main(demo=False):
-  # FrogPilot variables
   frogpilot_toggles = get_frogpilot_toggles()
 
-  frogpilot_model = frogpilot_toggles.frogpilot_model
-  model_name = frogpilot_toggles.model
-  model_version = frogpilot_toggles.model_version
+  model_version = frogpilot_toggles.model_versions.split(",")[frogpilot_toggles.available_models.split(",").index(MODEL)]
 
-  cloudlog.warning("classic_modeld init")
+  navigation = model_version in {"v1"}
+  radarless = model_version in {"v1"}
+
+  cloudlog.warning("frogpilot_modeld init")
 
   sentry.set_tag("daemon", PROCESS_NAME)
   cloudlog.bind(daemon=PROCESS_NAME)
@@ -148,8 +144,8 @@ def main(demo=False):
   cloudlog.warning("setting up CL context")
   cl_context = CLContext()
   cloudlog.warning("CL context ready; loading model")
-  model = ModelState(cl_context, model_name, model_version)
-  cloudlog.warning("models loaded, classic_modeld starting")
+  model = ModelState(cl_context, MODEL, model_version, navigation, radarless)
+  cloudlog.warning("models loaded, frogpilot_modeld starting")
 
   # visionipc clients
   while True:
@@ -175,14 +171,14 @@ def main(demo=False):
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
   # messaging
-  pm = PubMaster(["modelV2", "cameraOdometry"])
+  pm = PubMaster(["frogpilotModelV2"])
   sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "navModel", "navInstruction", "carControl", "liveTracks", "frogpilotPlan"])
 
   publish_state = PublishState()
   params = Params()
 
   # setup filter to track dropped frames
-  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / (ModelConstants.MODEL_FREQ / 2 if frogpilot_model else ModelConstants.MODEL_FREQ))
+  frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
   frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
@@ -202,7 +198,7 @@ def main(demo=False):
   else:
     with car.CarParams.from_bytes(params.get("CarParams", block=True)) as msg:
       CP = msg
-  cloudlog.info("classic_modeld got CarParams: %s", CP.carName)
+  cloudlog.info("frogpilot_modeld got CarParams: %s", CP.carName)
 
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   steer_delay = CP.steerActuatorDelay + .2
@@ -264,7 +260,7 @@ def main(demo=False):
     # Enable/disable nav features
     timestamp_llk = sm["navModel"].locationMonoTime
     nav_valid = sm.valid["navModel"] # and (nanos_since_boot() - timestamp_llk < 1e9)
-    nav_enabled = nav_valid and model.navigation
+    nav_enabled = nav_valid and navigation
 
     if not nav_enabled:
       nav_features[:] = 0
@@ -310,33 +306,30 @@ def main(demo=False):
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
       'lateral_control_params': lateral_control_params,
-      **({'nav_features': nav_features, 'nav_instructions': nav_instructions} if model.navigation else {}),
-      **({'radar_tracks': radar_tracks} if model.radarless else {}),
+      **({'nav_features': nav_features, 'nav_instructions': nav_instructions} if navigation else {}),
+      **({'radar_tracks': radar_tracks} if radarless else {}),
     }
 
     mt1 = time.perf_counter()
-    model_output = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs, prepare_only)
+    model_output = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs, prepare_only, navigation, radarless)
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
     if model_output is not None:
-      modelv2_send = messaging.new_message('modelV2')
-      posenet_send = messaging.new_message('cameraOdometry')
-      fill_model_msg(modelv2_send, model_output, publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id, frame_drop_ratio,
-                      meta_main.timestamp_eof, timestamp_llk, model_execution_time, live_calib_seen, nav_enabled, frogpilot_model)
+      frogpilotModelV2_send = messaging.new_message('frogpilotModelV2')
+      fill_model_msg(frogpilotModelV2_send, model_output, publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id, frame_drop_ratio,
+                      meta_main.timestamp_eof, timestamp_llk, model_execution_time, live_calib_seen, nav_enabled)
 
-      desire_state = modelv2_send.modelV2.meta.desireState
+      desire_state = frogpilotModelV2_send.frogpilotModelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, sm['frogpilotPlan'], frogpilot_toggles)
-      modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
-      modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
-      modelv2_send.modelV2.meta.turnDirection = DH.turn_direction
+      frogpilotModelV2_send.frogpilotModelV2.meta.laneChangeState = DH.lane_change_state
+      frogpilotModelV2_send.frogpilotModelV2.meta.laneChangeDirection = DH.lane_change_direction
+      frogpilotModelV2_send.frogpilotModelV2.meta.turnDirection = DH.turn_direction
 
-      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
-      pm.send('modelV2', modelv2_send)
-      pm.send('cameraOdometry', posenet_send)
+      pm.send('frogpilotModelV2', frogpilotModelV2_send)
 
     last_vipc_frame_id = meta_main.frame_id
 
